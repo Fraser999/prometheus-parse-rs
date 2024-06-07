@@ -166,7 +166,7 @@ impl Labels {
     fn parse(s: &str) -> Labels {
         let mut l = HashMap::new();
         for kv in s.split(',') {
-            let kvpair = kv.split('=').collect::<Vec<_>>();
+            let kvpair = kv.splitn(2, '=').collect::<Vec<_>>();
             if kvpair.len() != 2 || kvpair[0].is_empty() {
                 continue;
             }
@@ -474,6 +474,15 @@ mod tests {
             )
         );
         assert_eq!(Labels::parse("==="), Labels(HashMap::new()),);
+        assert_eq!(
+            Labels::parse(r#"base64_id="aWQ=",hex_id="6964""#),
+            Labels(
+                [("base64_id", "aWQ="), ("hex_id", "6964")]
+                    .iter()
+                    .map(pair_to_string)
+                    .collect()
+            )
+        );
     }
 
     #[test]
