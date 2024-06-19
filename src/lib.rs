@@ -7,10 +7,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::ops::Deref;
 
-static HELP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#\s+HELP\s+(\w+)\s+(.+)$").unwrap());
-static TYPE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#\s+TYPE\s+(\w+)\s+(\w+)").unwrap());
+// See https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels for valid metric
+// names and labels.
+static HELP_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^#\s+HELP\s+([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(.+)$").unwrap());
+static TYPE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^#\s+TYPE\s+([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(\w+)").unwrap());
 static SAMPLE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?P<name>\w+)(\{(?P<labels>[^}]+)\})?\s+(?P<value>\S+)(\s+(?P<timestamp>\S+))?")
+    Regex::new(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(\{(?P<labels>.+)\})?\s+(?P<value>\S+)(\s+(?P<timestamp>\S+))?")
         .unwrap()
 });
 
@@ -155,6 +159,96 @@ pub struct SummaryCount {
     pub count: f64,
 }
 
+/// A small state machine to support parsing labels.
+///
+/// The enum is fed a sequence of chars, and as each is pushed, the state machine is updated. We
+/// expect to transition through the states in declaration order, with the exception that we can
+/// toggle between `InValue` and `InEscape` as we receive escape chars `\` while parsing the value.
+///
+/// For the given sequence of chars comprising a single label, the states after being fed each char
+/// are:
+/// ```txt
+/// ,  label_name="label_value /" further value"
+/// |  InName    ||   InValue  ||   InValue    |
+///           InEquals       InEscape       Complete
+/// ```
+///
+/// The label name must match the regex `[a-zA-Z_][a-zA-Z0-9_]*` as specified in
+/// https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels. It must be immediately
+/// followed by `="`. All following chars constitute the label's value until an unescaped `"` is
+/// reached, indicating the end of the label.
+enum LabelParseState {
+    InName(String),
+    InEquals(String),
+    InValue { name: String, value: String },
+    InEscape { name: String, value: String },
+    Complete { name: String, value: String },
+}
+
+impl LabelParseState {
+    fn new() -> Self {
+        LabelParseState::InName(String::new())
+    }
+
+    fn push(self, c: char) -> Option<Self> {
+        use LabelParseState::*;
+        match self {
+            InName(mut name) => {
+                let is_valid = if name.is_empty() {
+                    // Allow for a comma and space(s) left from after the previous label.
+                    if c == ',' || c == ' ' {
+                        return Some(InName(name));
+                    }
+                    // Label name's first char must match `[a-zA-Z_]`.
+                    c.is_ascii_alphabetic() || c == '_'
+                } else if c == '=' {
+                    // We're done with the label's name.
+                    return Some(InEquals(name));
+                } else {
+                    // Subsequent chars must match `[a-zA-Z0-9_]`.
+                    c.is_ascii_alphanumeric() || c == '_'
+                };
+                if is_valid {
+                    name.push(c);
+                    return Some(InName(name));
+                }
+                None
+            }
+            InEquals(name) => {
+                // There should be exactly one double quote immediately after the equals symbol.
+                if c == '"' {
+                    return Some(InValue {
+                        name,
+                        value: String::new(),
+                    });
+                }
+                None
+            }
+            InValue { name, mut value } => {
+                // If we hit an escape char or a double quote, transition state. Otherwise append.
+                match c {
+                    '\\' => {
+                        // If we hit an escape char, we don't want to unescape it, we only
+                        // transition state to avoid finishing on an escaped double quote.
+                        value.push(c);
+                        Some(InEscape { name, value })
+                    }
+                    '"' => Some(Complete { name, value }),
+                    _ => {
+                        value.push(c);
+                        Some(InValue { name, value })
+                    }
+                }
+            }
+            InEscape { name, mut value } => {
+                value.push(c);
+                Some(InValue { name, value })
+            }
+            Complete { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Labels(HashMap<String, String>);
 
@@ -165,15 +259,19 @@ impl Labels {
 
     fn parse(s: &str) -> Labels {
         let mut l = HashMap::new();
-        for kv in s.split(',') {
-            let kvpair = kv.splitn(2, '=').collect::<Vec<_>>();
-            if kvpair.len() != 2 || kvpair[0].is_empty() {
-                continue;
+        let mut current_label = LabelParseState::new();
+        for c in s.chars() {
+            match current_label.push(c) {
+                Some(LabelParseState::Complete { name, value }) => {
+                    // If the value is empty, ignore the label.
+                    if !value.is_empty() {
+                        l.insert(name, value);
+                    }
+                    current_label = LabelParseState::new();
+                }
+                Some(updated_state) => current_label = updated_state,
+                None => break,
             }
-            l.insert(
-                kvpair[0].to_string(),
-                kvpair[1].trim_matches('"').to_string(),
-            );
         }
         Labels(l)
     }
@@ -239,8 +337,8 @@ pub struct Scrape {
 
 fn parse_golang_float(s: &str) -> Result<f64, <f64 as std::str::FromStr>::Err> {
     match s.to_lowercase().as_str() {
-        "nan" => Ok(std::f64::NAN), // f64::parse doesn't recognize 'nan'
-        s => s.parse::<f64>(),      // f64::parse expects lowercase [+-]inf
+        "nan" => Ok(f64::NAN), // f64::parse doesn't recognize 'nan'
+        s => s.parse::<f64>(), // f64::parse expects lowercase [+-]inf
     }
 }
 
@@ -395,21 +493,30 @@ mod tests {
             }
         );
         assert_eq!(
-            LineInfo::parse("foo{bar=baz} 2 1543182234"),
+            LineInfo::parse(r#"foo{bar="baz"} 2 1543182234"#),
             LineInfo::Sample {
                 metric_name: "foo",
                 value: "2",
-                labels: Some("bar=baz"),
+                labels: Some(r#"bar="baz""#),
                 timestamp: Some("1543182234"),
             }
         );
         assert_eq!(
-            LineInfo::parse("foo{bar=baz,quux=nonce} 2 1543182234"),
+            LineInfo::parse(r#"foo{bar="baz",quux="nonce"} 2 1543182234"#),
             LineInfo::Sample {
                 metric_name: "foo",
                 value: "2",
-                labels: Some("bar=baz,quux=nonce"),
+                labels: Some(r#"bar="baz",quux="nonce""#),
                 timestamp: Some("1543182234"),
+            }
+        );
+        assert_eq!(
+            LineInfo::parse(r#"nested{foo="{a=\"1\", b=\"\n\", c=\"\\\"}"} 1"#),
+            LineInfo::Sample {
+                metric_name: "nested",
+                value: "1",
+                labels: Some(r#"foo="{a=\"1\", b=\"\n\", c=\"\\\"}""#),
+                timestamp: None,
             }
         );
         assert_eq!(
@@ -435,22 +542,6 @@ mod tests {
 
     #[test]
     fn test_labels_parse() {
-        assert_eq!(
-            Labels::parse("foo=bar"),
-            Labels([("foo", "bar")].iter().map(pair_to_string).collect())
-        );
-        assert_eq!(
-            Labels::parse("foo=bar,"),
-            Labels([("foo", "bar")].iter().map(pair_to_string).collect())
-        );
-        assert_eq!(
-            Labels::parse(",foo=bar,"),
-            Labels([("foo", "bar")].iter().map(pair_to_string).collect())
-        );
-        assert_eq!(
-            Labels::parse("=,foo=bar,"),
-            Labels([("foo", "bar")].iter().map(pair_to_string).collect())
-        );
         assert_eq!(
             Labels::parse(r#"foo="bar""#),
             Labels([("foo", "bar")].iter().map(pair_to_string).collect())
@@ -478,6 +569,15 @@ mod tests {
             Labels::parse(r#"base64_id="aWQ=",hex_id="6964""#),
             Labels(
                 [("base64_id", "aWQ="), ("hex_id", "6964")]
+                    .iter()
+                    .map(pair_to_string)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            Labels::parse(r#"foo="{a=\"1\", b=\"\n\", c=\"\\\"}""#),
+            Labels(
+                [("foo", r#"{a=\"1\", b=\"\n\", c=\"\\\"}"#)]
                     .iter()
                     .map(pair_to_string)
                     .collect()
